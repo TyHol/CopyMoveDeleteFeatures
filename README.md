@@ -1,3 +1,4 @@
+# Experimental
 # CopyMoveDeleteFeatures
 
 A [QField](https://qfield.org) plugin to filter, select and copy, move or delete features between editable layers.
