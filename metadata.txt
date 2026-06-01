@@ -1,0 +1,7 @@
+[general]
+name=CopyMoveDeleteFeatures
+description=Filter features by expression, then copy, move or delete the selected subset between editable layers.
+author=tyhol
+icon=icon.svg
+version=0.7
+homepage=https://github.com/TyHol/DeleteViaDropdown
