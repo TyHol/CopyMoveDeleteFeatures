@@ -16,8 +16,19 @@ Item {
     // Cached field type for the currently selected filter field
     property string _currentFieldType: "text"
 
-    // Feature count set by Execute before opening the confirm dialog
-    property int    _pendingCount: 0
+    // Total matched count set by tryExecute() — shown in the feature list dialog
+    property int  _totalMatchedCount: 0
+    // True when the feature list is capped and more features exist beyond it
+    property bool _listTruncated:     false
+    // Guard against label-field selector rebuild triggering reloadLabels() prematurely
+    property bool _listLabelGuard:    false
+    // Chunked-loading state — keeps UI responsive while building the checklist
+    property bool _isLoading:  false   // true while counting or chunk-loading
+    property var  _loadIter:   null    // active feature iterator
+    property int  _loadDone:   0       // features loaded so far
+
+    // Feature checklist — { fid, label, checked }
+    ListModel { id: featureChecklistModel }
 
     // FeatureModel used to write features into the destination layer (move/copy)
     FeatureModel {
@@ -67,12 +78,12 @@ Item {
         standardButtons: Dialog.NoButton
         font: Theme.defaultFont
         width:  Math.min(mainWindow.width * 0.9, 420)
-        height: Math.min(mainWindow.height - 40, 560)
+        height: Math.min(mainWindow.height - 40, 660)
         anchors.centerIn: parent
 
         // Custom header: title on the left, Help button on the right
         header: Item {
-            implicitHeight: headerRow.implicitHeight + 20
+            implicitHeight: headerRow.implicitHeight + 6
             RowLayout {
                 id: headerRow
                 anchors {
@@ -132,7 +143,7 @@ Item {
                 width: mainScrollView.width
                        - (mainScrollView.ScrollBar.vertical.visible
                           ? mainScrollView.ScrollBar.vertical.width : 0)
-                spacing: 6
+                spacing: 4
 
                 // ── Mode buttons ──────────────────────────────────────────────
                 RowLayout {
@@ -205,6 +216,7 @@ Item {
                 ComboBox {
                     id: layerSelector
                     Layout.fillWidth: true; model: []; font: Theme.tipFont
+                    topPadding: 4; bottomPadding: 4
                     onCurrentTextChanged: {
                         updateFieldSelector()
                         updateDestLayerSelector()
@@ -220,6 +232,7 @@ Item {
                 ComboBox {
                     id: destLayerSelector
                     Layout.fillWidth: true; model: []; font: Theme.tipFont
+                    topPadding: 4; bottomPadding: 4
                     visible: _mode === "move" || _mode === "copy"
                     onCurrentTextChanged: updateFieldMapLabel()
                 }
@@ -234,7 +247,7 @@ Item {
                 ColumnLayout {
                     visible: _useFilter
                     Layout.fillWidth: true
-                    spacing: 6
+                    spacing: 4
 
                     // Filter section label
                     //Label { text: qsTr("Filter"); font: Theme.tipFont; color: Theme.mainTextColor }
@@ -245,6 +258,7 @@ Item {
                         ComboBox {
                             id: fieldSelector
                             Layout.fillWidth: true; model: []; font: Theme.tipFont
+                            topPadding: 4; bottomPadding: 4
                             displayText: currentText || qsTr("Field…")
                             onCurrentTextChanged: {
                                 valueField.text = ""
@@ -256,11 +270,14 @@ Item {
                         ComboBox {
                             id: operatorSelector
                             Layout.preferredWidth: 80; font: Theme.tipFont
+                            topPadding: 4; bottomPadding: 4
                             model: ["=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"]
                             onCurrentTextChanged: {
                                 suggestionPopup.close()
+                                // Only auto-suggest when the user has already typed something.
+                                // Scanning a large layer on an empty field causes freezes.
                                 if (currentText !== "IS NULL" && currentText !== "IS NOT NULL"
-                                        && valueField.text.trim() === "")
+                                        && valueField.text.trim().length > 1)
                                     suggestionTimer.restart()
                             }
                         }
@@ -276,6 +293,7 @@ Item {
                         TextField {
                             id: valueField
                             anchors.fill: parent; font: Theme.tipFont
+                            topPadding: 4; bottomPadding: 4
                             placeholderText: {
                                 var op = operatorSelector.currentText
                                 if (op === "IN" || op === "NOT IN")      return qsTr("val1, val2, val3…")
@@ -285,11 +303,14 @@ Item {
                             }
                             onTextEdited: {
                                 if (/^\w+\s*\(/.test(text)) { suggestionPopup.close(); return }
-                                suggestionTimer.restart()
+                                // Only scan for suggestions once the user has typed ≥ 2 chars —
+                                // avoids scanning a large layer on every single keypress.
+                                if (text.trim().length >= 2) suggestionTimer.restart()
+                                else suggestionPopup.close()
                             }
                             onActiveFocusChanged: {
-                                if (activeFocus && !/^\w+\s*\(/.test(text)) suggestionTimer.restart()
-                                else suggestionPopup.close()
+                                // Don't auto-scan on focus alone — wait for the user to type.
+                                if (!activeFocus) suggestionPopup.close()
                             }
                         }
 
@@ -326,20 +347,19 @@ Item {
                         }
                     }
 
-                    // Apply / Clear buttons
+                    // ── Filter action buttons ─────────────────────────────────
+                    // Row 1: Set (replace expression) and Clear
                     RowLayout {
                         Layout.fillWidth: true; spacing: 4
                         Button {
-                            text: qsTr("Apply Filter"); Layout.fillWidth: true; font: Theme.tipFont
+                            text: qsTr("Apply Filter")
+                            Layout.fillWidth: true; font: Theme.tipFont
                             enabled: fieldSelector.currentText !== ""
                                   && (valueField.text.trim() !== "" || !valueField.visible)
                             onClicked: {
                                 suggestionPopup.close()
-                                var expr = buildExpression()
-                                if (expr) {
-                                    exprField.text = expr
-                                    saveLayerFilter(layerSelector.currentText)
-                                }
+                                var expr = buildExpression()   // replaces expression box
+                                if (expr) saveLayerFilter(layerSelector.currentText)
                             }
                         }
                         Button {
@@ -352,6 +372,24 @@ Item {
                             }
                         }
                     }
+                    // Row 2: AND / OR — append a second (or further) condition
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 4
+                        Button {
+                            text: qsTr("+ AND")
+                            Layout.fillWidth: true; font: Theme.tipFont
+                            enabled: fieldSelector.currentText !== ""
+                                  && (valueField.text.trim() !== "" || !valueField.visible)
+                            onClicked: { suggestionPopup.close(); appendCondition("AND") }
+                        }
+                        Button {
+                            text: qsTr("+ OR")
+                            Layout.fillWidth: true; font: Theme.tipFont
+                            enabled: fieldSelector.currentText !== ""
+                                  && (valueField.text.trim() !== "" || !valueField.visible)
+                            onClicked: { suggestionPopup.close(); appendCondition("OR") }
+                        }
+                    }
 
                     // Editable expression field
                     Label { id: exprPreviewLabel; text: ""; visible: false }
@@ -359,6 +397,7 @@ Item {
                     TextField {
                         id: exprField
                         Layout.fillWidth: true
+                        topPadding: 4; bottomPadding: 4
                         font.family: "monospace"; font.pointSize: Theme.tipFont.pointSize
                         placeholderText: qsTr("e.g. \"name\" = 'Tom'")
                         wrapMode: TextInput.Wrap
@@ -377,82 +416,184 @@ Item {
         }   // end ScrollView
 
         // ── Pinned Execute / Cancel bar ───────────────────────────────────
-        RowLayout {
+        ColumnLayout {
             Layout.fillWidth: true
-            spacing: 6
+            spacing: 4
             Layout.topMargin: 4
             Layout.bottomMargin: 4
             Layout.leftMargin: 2
             Layout.rightMargin: 2
 
-            Button {
-                text: qsTr("Cancel")
+            // Loading indicator — visible while counting / building the feature list
+            RowLayout {
                 Layout.fillWidth: true
-                font: Theme.defaultFont
-                onClicked: mainDialog.close()
+                visible: _isLoading
+                spacing: 8
+                BusyIndicator {
+                    running: _isLoading
+                    implicitWidth: 28; implicitHeight: 28
+                }
+                Label {
+                    text: qsTr("Loading features…")
+                    font: Theme.tipFont
+                    color: Theme.secondaryTextColor
+                    Layout.fillWidth: true
+                }
             }
-            Button {
-                text: qsTr("Execute")
+
+            RowLayout {
                 Layout.fillWidth: true
-                highlighted: true
-                font: Theme.defaultFont
-                onClicked: tryExecute()   // keeps mainDialog open; confirm dialog opens on top
+                spacing: 6
+                Button {
+                    text: qsTr("Cancel")
+                    Layout.fillWidth: true
+                    font: Theme.defaultFont
+                    enabled: !_isLoading
+                    onClicked: { _loadIter = null; _isLoading = false; mainDialog.close() }
+                }
+                Button {
+                    text: _isLoading ? qsTr("Working…") : qsTr("Execute")
+                    Layout.fillWidth: true
+                    highlighted: true
+                    font: Theme.defaultFont
+                    enabled: !_isLoading
+                    onClicked: tryExecute()
+                }
             }
         }
 
         }   // end outer ColumnLayout
     }   // end mainDialog
 
-    // ── Confirm dialog — shows feature count, Proceed / Cancel ───────────────
+    // ── Feature list dialog ───────────────────────────────────────────────────
+    // Opens after Execute. Shows matched features as a checklist so the user
+    // can deselect individual features before proceeding.
+    // Capped at 500 — a truncation warning is shown if more features exist.
     Dialog {
-        id: confirmDialog
+        id: featureListDialog
         parent: mainWindow.contentItem
         modal: true
         font: Theme.defaultFont
         standardButtons: Dialog.NoButton
         anchors.centerIn: parent
-        width: Math.min(mainWindow.width * 0.9, 420)
-        title: _mode === "move" ? qsTr("Confirm Move")
-             : _mode === "copy" ? qsTr("Confirm Copy")
-             : qsTr("Confirm Delete")
+        width:  Math.min(mainWindow.width * 0.9, 420)
+        height: Math.min(mainWindow.height - 40, 700)
+        title: _mode === "move" ? qsTr("Select features to move")
+             : _mode === "copy" ? qsTr("Select features to copy")
+             : qsTr("Select features to delete")
 
         ColumnLayout {
-            width: parent.width
-            spacing: 12
+            anchors.fill: parent
+            spacing: 6
 
-            // ── Feature count — large and prominent ───────────────────────────
+            // ── Summary / truncation warning ──────────────────────────────────
             Label {
                 Layout.fillWidth: true
-                text: {
-                    var n    = _pendingCount
-                    var noun = n === 10001 ? qsTr("10,000+ features")
-                             : n === 1     ? qsTr("1 feature")
-                             : qsTr("%1 features").arg(n)
-                    var verb = _mode === "move" ? qsTr("will be moved")
-                             : _mode === "copy" ? qsTr("will be copied")
-                             : qsTr("will be deleted")
-                    var src  = qsTr(" from '%1'").arg(layerSelector.currentText)
-                    var dest = (_mode === "move" || _mode === "copy")
-                               ? qsTr("\n→  '%1'").arg(destLayerSelector.currentText) : ""
-                    return noun + " " + verb + src + dest
-                }
-                font.pointSize: Theme.defaultFont.pointSize * 1.15
-                font.bold: true
-                color: _mode === "delete" ? "#c0392b"   // red for delete
-                     : _mode === "move"   ? "#e67e22"   // amber for move
-                     : "#2980b9"                        // blue for copy
                 wrapMode: Text.Wrap
+                font: Theme.tipFont
+                color: _listTruncated ? "#e67e22" : Theme.mainTextColor
+                text: {
+                    var shown = featureChecklistModel.count
+                    var total = _totalMatchedCount
+                    // total = 501 means "more than 500 matched" (count was capped)
+                    var totalStr = total > 500 ? qsTr("500+") : String(total)
+                    if (_listTruncated)
+                        return qsTr("!! Showing first %1 of %2 matched features. " +
+                                    "Refine your filter to see more. " +
+                                    "Proceed acts on checked features only.")
+                               .arg(shown).arg(totalStr)
+                    return qsTr("%1 feature(s) matched. Deselect any to exclude.")
+                               .arg(shown)
+                }
             }
 
-            // ── Expression (shown only when a filter is active) ───────────────
+            // ── Expression reminder (filter mode) ─────────────────────────────
             Label {
                 Layout.fillWidth: true
                 visible: _useFilter && exprField.text.trim() !== ""
-                text: qsTr("Filter:  ") + exprField.text.trim()
+                text: exprField.text.trim()
                 font.family: "monospace"
                 font.pointSize: Theme.tipFont.pointSize
                 color: Theme.secondaryTextColor
                 wrapMode: Text.Wrap
+                elide: Text.ElideRight
+                maximumLineCount: 2
+            }
+
+            // ── Label field picker ────────────────────────────────────────────
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    text: qsTr("Identify by:")
+                    font: Theme.tipFont
+                    color: Theme.secondaryTextColor
+                }
+                ComboBox {
+                    id: listLabelSelector
+                    Layout.fillWidth: true
+                    font: Theme.tipFont
+                    topPadding: 4; bottomPadding: 4
+                    model: ["(auto)"]
+                    onCurrentTextChanged: {
+                        if (!_listLabelGuard) reloadListLabels()
+                    }
+                }
+            }
+
+            // ── All / None + selected count ───────────────────────────────────
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    id: selectedCountLabel
+                    Layout.fillWidth: true
+                    font: Theme.tipFont
+                    color: Theme.secondaryTextColor
+                    text: {
+                        var c = 0
+                        for (var i = 0; i < featureChecklistModel.count; i++)
+                            if (featureChecklistModel.get(i).checked) c++
+                        return qsTr("%1 of %2 selected").arg(c).arg(featureChecklistModel.count)
+                    }
+                }
+                Button {
+                    text: qsTr("All"); font: Theme.tipFont
+                    onClicked: {
+                        for (var i = 0; i < featureChecklistModel.count; i++)
+                            featureChecklistModel.setProperty(i, "checked", true)
+                    }
+                }
+                Button {
+                    text: qsTr("None"); font: Theme.tipFont
+                    onClicked: {
+                        for (var i = 0; i < featureChecklistModel.count; i++)
+                            featureChecklistModel.setProperty(i, "checked", false)
+                    }
+                }
+            }
+
+            // ── Checklist ─────────────────────────────────────────────────────
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy:   ScrollBar.AsNeeded
+                ColumnLayout {
+                    width: parent.availableWidth
+                    spacing: 0
+                    Repeater {
+                        model: featureChecklistModel
+                        delegate: CheckBox {
+                            Layout.fillWidth: true
+                            text: model.label
+                            checked: model.checked
+                            font: Theme.tipFont
+                            onCheckedChanged: featureChecklistModel.setProperty(index, "checked", checked)
+                        }
+                    }
+                }
             }
 
             // ── Proceed / Cancel ──────────────────────────────────────────────
@@ -461,90 +602,245 @@ Item {
                 spacing: 6
                 Button {
                     text: qsTr("Cancel"); Layout.fillWidth: true; font: Theme.defaultFont
-                    onClicked: confirmDialog.reject()   // closes confirm only; main dialog stays open
+                    onClicked: featureListDialog.reject()   // back to main dialog
                 }
                 Button {
                     text: qsTr("Proceed"); Layout.fillWidth: true
                     highlighted: true; font: Theme.defaultFont
-                    onClicked: confirmDialog.accept()   // executes, then closes both dialogs
+                    onClicked: featureListDialog.accept()
                 }
             }
         }
 
         onAccepted: {
+            // Collect IDs of checked features only
+            var ids = []
+            for (var i = 0; i < featureChecklistModel.count; i++) {
+                var item = featureChecklistModel.get(i)
+                if (item.checked) ids.push(item.fid)
+            }
+            if (ids.length === 0) {
+                mainWindow.displayToast(qsTr("No features selected — nothing to do."))
+                return
+            }
+
             var srcLayer = getLayerByName(layerSelector.currentText)
             if (!srcLayer) return
 
             if (_useFilter && fieldSelector.currentText && valueField.text.trim() !== "")
                 saveLayerFilter(layerSelector.currentText)
 
-            var expr = (_useFilter && exprField.text.trim() !== "") ? exprField.text.trim() : "1=1"
+            // Act only on the checked feature IDs
+            var expr        = "$id IN (" + ids.join(",") + ")"
+            var selectedN   = ids.length
+            var shownN      = featureChecklistModel.count
+            var totalN      = _totalMatchedCount
+            // Build "X of Y" string — omit "of Y" when all shown features are selected
+            var totalStr    = totalN > 500 ? qsTr("500+") : String(totalN)
+            var countLabel  = (selectedN === shownN && !_listTruncated)
+                              ? String(selectedN)
+                              : qsTr("%1 of %2").arg(selectedN).arg(totalStr)
 
             if (_mode === "move" || _mode === "copy") {
                 var dstLayer = getLayerByName(destLayerSelector.currentText)
                 if (!dstLayer) return
-                var count = directCopyMoveByExpression(srcLayer, dstLayer, expr, _mode === "move")
-                if (count > 0) {
+                var moved = directCopyMoveByExpression(srcLayer, dstLayer, expr, _mode === "move")
+                if (moved > 0) {
                     var verb = _mode === "move" ? qsTr("Moved") : qsTr("Copied")
                     mainWindow.displayToast(
-                        qsTr("%1 %2 feature(s): '%3' → '%4'")
-                            .arg(verb).arg(count).arg(srcLayer.name).arg(dstLayer.name))
+                        qsTr("%1 %2 feature(s) from '%3' → '%4'")
+                            .arg(verb).arg(countLabel).arg(srcLayer.name).arg(dstLayer.name))
                 }
             } else {
-                directDeleteByExpression(srcLayer, expr)
+                var ok = directDeleteByExpression(srcLayer, expr)
+                if (ok)
+                    mainWindow.displayToast(
+                        qsTr("Deleted %1 feature(s) from '%2'")
+                            .arg(countLabel).arg(srcLayer.name))
             }
-            // Close the main dialog after successful execution
             mainDialog.close()
         }
     }
 
     // ── Functions ─────────────────────────────────────────────────────────────
 
-    // ── Validate, count and open the confirm dialog ───────────────────────────
-    // Called by the Execute button. Does NOT close mainDialog — it stays open
-    // behind the confirm dialog so Cancel returns the user here.
+    // ── Validate then kick off async loading ──────────────────────────────────
+    // Sets _isLoading = true, yields to the event loop so the UI updates
+    // (spinner appears, button dims), then does the actual work.
     function tryExecute() {
         if (!layerSelector.currentText) {
-            mainWindow.displayToast(qsTr("Choose a source layer."))
-            return
+            mainWindow.displayToast(qsTr("Choose a source layer.")); return
         }
         if ((_mode === "move" || _mode === "copy") && !destLayerSelector.currentText) {
-            mainWindow.displayToast(qsTr("No compatible destination layer — destination must be the same geometry type as the source."))
-            return
+            mainWindow.displayToast(qsTr("No compatible destination layer — must match source geometry type.")); return
         }
         if (_useFilter && exprField.text.trim() === "") {
-            mainWindow.displayToast(qsTr("Enter a filter expression or switch to All."))
-            return
+            mainWindow.displayToast(qsTr("Enter a filter expression or switch to All.")); return
         }
+        _isLoading = true
+        // Yield one tick so the spinner and "Working…" button appear before we block
+        Qt.callLater(doExecute)
+    }
+
+    // Runs after the UI has updated. Counts features then starts chunked loading.
+    function doExecute() {
+        if (!_isLoading) return   // cancelled while waiting
         var srcLayer = getLayerByName(layerSelector.currentText)
-        if (!srcLayer) return
+        if (!srcLayer) { _isLoading = false; return }
         var expr = (_useFilter && exprField.text.trim() !== "") ? exprField.text.trim() : "1=1"
+
         var n = countMatchingFeatures(srcLayer, expr)
+        _totalMatchedCount = n
         if (n === 0) {
+            _isLoading = false
             mainWindow.displayToast(qsTr("No features matched — nothing to do."))
             return
         }
-        _pendingCount = n
-        confirmDialog.open()
+        startChunkedLoad(srcLayer, expr)
     }
 
-    // Count features matching expr (or all features for "1=1").
-    // Caps at 10 001 so we never hang on huge layers — returns 10001 to signal "10 000+".
+    // Initialise the chunked feature load — builds label selector, creates the
+    // iterator and schedules the first chunk.
+    function startChunkedLoad(layer, expr) {
+        featureChecklistModel.clear()
+        _listTruncated = false
+        _loadDone = 0
+
+        // Rebuild label-field selector without triggering reloadListLabels()
+        _listLabelGuard = true
+        var fieldNames = []
+        try { fieldNames = layer.fields.names ? layer.fields.names.slice() : [] } catch(e) {}
+        fieldNames.sort()
+        listLabelSelector.model = ["(auto)"].concat(fieldNames)
+        listLabelSelector.currentIndex = 0
+        _listLabelGuard = false
+
+        try {
+            _loadIter = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
+        } catch(e) {
+            _isLoading = false
+            mainWindow.displayToast(qsTr("Error reading features: %1").arg(e.toString()))
+            return
+        }
+        Qt.callLater(processLoadChunk)
+    }
+
+    // Process one chunk of 25 features then yield back to the event loop.
+    // This keeps the UI responsive — the spinner stays animated between chunks.
+    function processLoadChunk() {
+        if (!_isLoading || !_loadIter) { _loadIter = null; _isLoading = false; return }
+
+        var CHUNK = 25
+        var CAP   = 500
+        var nameCandidates = ["name", "label", "desc", "description", "title"]
+
+        try {
+            var i = 0
+            while (i < CHUNK && _loadDone < CAP && _loadIter.hasNext()) {
+                var f = _loadIter.next()
+                var fid = null
+                try { fid = (typeof f.id === "function") ? f.id() : f.id } catch(e) {}
+
+                var label = qsTr("Feature %1").arg(fid !== null ? fid : _loadDone + 1)
+                for (var nc = 0; nc < nameCandidates.length; nc++) {
+                    try {
+                        var v = f.attribute(nameCandidates[nc])
+                        if (v !== null && v !== undefined && String(v).trim() !== "") {
+                            label = String(v).trim(); break
+                        }
+                    } catch(e) {}
+                }
+                featureChecklistModel.append({
+                    fid: fid !== null ? fid : _loadDone, label: label, checked: true
+                })
+                _loadDone++
+                i++
+            }
+        } catch(e) {
+            _loadIter = null; _isLoading = false
+            mainWindow.displayToast(qsTr("Error loading features: %1").arg(e.toString()))
+            return
+        }
+
+        if (_loadIter.hasNext() && _loadDone < CAP) {
+            Qt.callLater(processLoadChunk)   // more to load — yield then continue
+        } else {
+            if (_loadIter.hasNext()) _listTruncated = true
+            _loadIter  = null
+            _isLoading = false
+            featureListDialog.open()
+        }
+    }
+
+    // Re-label the checklist when the user changes the label-field selector.
+    function reloadListLabels() {
+        var layer = getLayerByName(layerSelector.currentText)
+        if (!layer || featureChecklistModel.count === 0) return
+
+        var chosen  = listLabelSelector.currentText
+        var useAuto = (!chosen || chosen === "(auto)")
+        var nameCandidates = ["name", "label", "desc", "description", "title"]
+        var expr = (_useFilter && exprField.text.trim() !== "") ? exprField.text.trim() : "1=1"
+
+        // Build fid → label map from a fresh iterator pass
+        var labelMap = {}
+        var scanned  = 0
+        try {
+            var it = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
+            while (it.hasNext() && scanned < 500) {
+                var f = it.next()
+                var fid = null
+                try { fid = (typeof f.id === "function") ? f.id() : f.id } catch(e) {}
+                if (fid === null) { scanned++; continue }
+
+                var lbl = qsTr("Feature %1").arg(fid)
+                if (useAuto) {
+                    for (var nc = 0; nc < nameCandidates.length; nc++) {
+                        try {
+                            var v = f.attribute(nameCandidates[nc])
+                            if (v !== null && v !== undefined && String(v).trim() !== "") {
+                                lbl = String(v).trim(); break
+                            }
+                        } catch(e) {}
+                    }
+                } else {
+                    try {
+                        var cv = f.attribute(chosen)
+                        if (cv !== null && cv !== undefined && String(cv).trim() !== "")
+                            lbl = String(cv).trim()
+                    } catch(e) {}
+                }
+                labelMap[fid] = lbl
+                scanned++
+            }
+        } catch(e) {}
+
+        for (var i = 0; i < featureChecklistModel.count; i++) {
+            var item = featureChecklistModel.get(i)
+            if (labelMap[item.fid] !== undefined)
+                featureChecklistModel.setProperty(i, "label", labelMap[item.fid])
+        }
+    }
+
+    // Count features matching expr.
+    // Caps at 501 — just enough to know whether we exceed the 500-item checklist
+    // limit, without iterating through thousands of features unnecessarily.
+    // Returns 501 to signal "more than 500".
     function countMatchingFeatures(layer, expr) {
         if (!layer) return 0
-        // Fast path: entire layer with no filter
+        // Fast path: entire layer, no filter
         if (expr === "1=1") {
             try {
                 var fc = (typeof layer.featureCount === "function")
                          ? layer.featureCount() : layer.featureCount
-                if (typeof fc === "number" && fc >= 0) return Math.min(fc, 10001)
+                if (typeof fc === "number" && fc >= 0) return fc
             } catch(e) {}
         }
-        // Filtered: iterate and count (cap at 10 001 to stay responsive)
+        // Filtered: iterate up to 501 only
         var count = 0
         try {
             var it = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
-            while (it.hasNext() && count < 10001) { it.next(); count++ }
+            while (it.hasNext() && count <= 500) { it.next(); count++ }
         } catch(e) { return 0 }
         return count
     }
@@ -720,25 +1016,8 @@ Item {
                 }
             } catch(e) {}
         } catch(e) {}
-        try {
-            var it = LayerUtils.createFeatureIteratorFromExpression(
-                layer, '"' + fieldName + '" IS NOT NULL')
-            if (it.hasNext()) {
-                var rawVal = it.next().attribute(fieldName)
-                if (rawVal instanceof Date)
-                    return isNaN(rawVal.getTime()) ? "text" : "datetime"
-                var sv = String(rawVal || "").trim()
-                if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(sv)) return "datetime"
-                if (/^\d{4}-\d{2}-\d{2}$/.test(sv))                 return "date"
-                if (sv.length > 10 && isNaN(parseFloat(sv))) {
-                    try {
-                        var pd = new Date(sv)
-                        if (!isNaN(pd.getTime()) && pd.getFullYear() > 1900 && pd.getFullYear() < 2200)
-                            return "datetime"
-                    } catch(e) {}
-                }
-            }
-        } catch(e) {}
+        // Method 3 (sample-value iterator) removed — it blocks the UI on large layers.
+        // Methods 1 and 2 cover all properly-configured layers. Fall back to "text".
         return "text"
     }
 
@@ -796,7 +1075,7 @@ Item {
         try {
             var it = LayerUtils.createFeatureIteratorFromExpression(layer, iterExpr)
             var scanned = 0
-            while (it.hasNext() && values.length < 15 && scanned < 200) {
+            while (it.hasNext() && values.length < 10 && scanned < 50) {
                 var feat = it.next()
                 var raw  = null
                 try { raw = feat.attribute(field) } catch(e) {}
@@ -812,7 +1091,9 @@ Item {
         if (values.length > 0) suggestionPopup.open()
     }
 
-    function buildExpression() {
+    // Build a condition string from the current field/operator/value controls
+    // WITHOUT writing to exprField — callers decide what to do with the result.
+    function buildCondition() {
         var field = fieldSelector.currentText
         var op    = operatorSelector.currentText
         if (!field) return ""
@@ -853,9 +1134,6 @@ Item {
             expr = '"' + field + '" ' + op + ' (' + inVals.join(", ") + ')'
 
         } else if (isFunction || isNumeric) {
-            // today() with = on a datetime field: strip the time before comparing,
-            // otherwise no features match (date != datetime with time component).
-            // today() with < / > works fine as-is; now() is always passed through.
             if (isFunction && fieldType === "datetime" && op === "="
                     && /^today\s*\(/i.test(raw)) {
                 expr = 'date("' + field + '") = today()'
@@ -880,8 +1158,30 @@ Item {
             expr = '"' + field + '" ' + op + " '" + raw.replace(/'/g, "''") + "'"
         }
 
-        exprField.text = expr
         return expr
+    }
+
+    // Build condition and write it to the expression box (replaces any existing expression).
+    function buildExpression() {
+        var expr = buildCondition()
+        if (expr) exprField.text = expr
+        return expr
+    }
+
+    // Append a new condition to the expression box with the given join word (AND / OR).
+    function appendCondition(joinWord) {
+        var cond = buildCondition()
+        if (!cond) return
+        var existing = exprField.text.trim()
+        if (existing !== "") {
+            // Wrap existing in parens if it isn't already, then append
+            var wrapped = (existing.charAt(0) === "(" && existing.charAt(existing.length - 1) === ")")
+                          ? existing : "(" + existing + ")"
+            exprField.text = wrapped + " " + joinWord + " " + cond
+        } else {
+            exprField.text = cond
+        }
+        saveLayerFilter(layerSelector.currentText)
     }
 
     // ── Execute: delete ALL features matching expr ────────────────────────────
@@ -894,9 +1194,7 @@ Item {
             if (ok) {
                 layer.commitChanges()
                 layer.triggerRepaint()
-                mainWindow.displayToast(
-                    qsTr("Deleted all matching features from '%1'.").arg(layer.name))
-                return true
+                return true   // caller shows the toast with the "X of Y" message
             }
             layer.rollBack()
             mainWindow.displayToast(qsTr("Delete failed."))
@@ -1017,22 +1315,24 @@ Item {
                     text: qsTr(
                         "1. Choose Delete, Move or Copy at the top.\n" +
                         "2. Pick a source layer.\n" +
-                        "   For Move or Copy, a destination layer is also required — " +
-                        "only layers with the same geometry type as the source are listed.\n" +
-                        "3. Choose All (acts on every feature in the layer) or Filter " +
-                        "(narrows by expression).\n" +
+                        "   For Move or Copy a destination layer is also required — " +
+                        "only layers with the same geometry type are listed.\n" +
+                        "3. Choose All (entire layer) or Filter (by expression).\n" +
                         "4. If using Filter:\n" +
-                        "   • Pick a field, operator and value, then tap Apply Filter to " +
-                        "build the expression.\n" +
-                        "   • The Expression box is filled automatically — you can also " +
-                        "type or edit it directly for complex filters.\n" +
-                        "   • Typing in the value box shows matching values from the layer " +
-                        "as a suggestion list.\n" +
-                        "5. Tap Execute.\n" +
-                        "   The plugin counts how many features will be affected and shows " +
-                        "the total before anything changes.\n" +
-                        "6. Review the count in the confirmation screen, then tap Proceed " +
-                        "to run or Cancel to go back and adjust."
+                        "   • Pick a field, operator and value.\n" +
+                        "   • Tap Apply Filter to set the expression, or + AND / + OR " +
+                        "to add a second (or further) condition to an existing one.\n" +
+                        "   • Edit the Expression box directly for anything more complex.\n" +
+                        "   • Type at least 2 characters in the value box to see " +
+                        "matching values from the layer as suggestions.\n" +
+                        "5. Tap Execute. The plugin loads matching features into a list " +
+                        "while showing a spinner — this may take a moment on large layers.\n" +
+                        "6. Review the feature list:\n" +
+                        "   • Use Identify by to choose which field labels each row.\n" +
+                        "   • Uncheck any features you want to exclude.\n" +
+                        "   • Use All / None to select or clear everything at once.\n" +
+                        "7. Tap Proceed to run (shows 'X of Y features' result) or " +
+                        "Cancel to go back to the main dialog."
                     )
                 }
 
@@ -1047,21 +1347,24 @@ Item {
                     Layout.fillWidth: true; wrapMode: Text.Wrap
                     font: Theme.tipFont; color: Theme.mainTextColor
                     text: qsTr(
-                        "• The action always runs on ALL features matching the expression " +
-                        "(or all features in the layer when All is selected). There is no " +
-                        "per-feature tick list — this is intentional.\n\n" +
+                        "• The feature list is capped at 500. If more features match, " +
+                        "a warning is shown and Proceed acts on the checked subset only. " +
+                        "Use a tighter filter to see the full set.\n\n" +
+                        "• Compound filters: use + AND / + OR to chain conditions. " +
+                        "Each tap appends a new condition to whatever is already in " +
+                        "the Expression box. Apply Filter replaces it.\n\n" +
+                        "• today() with = on a datetime field is automatically rewritten " +
+                        "to date(\"field\") = today() so the time component is ignored.\n\n" +
                         "• For Move and Copy: only layers with a matching geometry type " +
                         "(point → point, line → line, polygon → polygon) appear in the " +
-                        "destination list. Mismatched layers are excluded automatically.\n" +
-                        "  Fields are matched by name — fields that exist in both layers " +
-                        "are copied; source fields with no matching name in the destination " +
-                        "are silently dropped (shown in the ✘ dropped line below the " +
-                        "destination selector).\n\n" +
-                        "• ⚠ Performance: counting and executing may be slow on layers " +
-                        "with very large numbers of features. Use a filter to narrow the " +
-                        "scope where possible.\n\n" +
-                        "• Filters are saved per layer and restored automatically the next " +
-                        "time you open the plugin. Tap Clear to remove a saved filter."
+                        "destination list. Fields are matched by name — unmatched source " +
+                        "fields are dropped (shown as ✘ dropped below the selector).\n\n" +
+                        "• ⚠ Performance: the feature list loads in small chunks to keep " +
+                        "the UI responsive, but executing Move or Copy on very large " +
+                        "matched sets may still cause a pause. Use a filter to narrow " +
+                        "the scope where possible.\n\n" +
+                        "• Filters are saved per layer and restored next session. " +
+                        "Tap Clear to remove a saved filter."
                     )
                 }
 

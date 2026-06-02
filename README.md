@@ -5,12 +5,13 @@ A [QField](https://qfield.org) plugin to delete, copy or move features between e
 
 ## What it does
 
-- **Delete** features from a layer (filtered or all)
+- **Delete** features from a layer (filtered or entire layer)
 - **Copy** features to another layer of the same geometry type
 - **Move** features (copy to destination + delete from source)
-- **Filter** using a point-and-click field/operator/value builder, or type a QGIS expression directly
-- Shows a **feature count** before anything is changed, with a Proceed / Cancel step
-- Always acts on **all** features matching the expression — there is no per-feature tick list
+- **Filter** using a point-and-click field / operator / value builder, compound AND / OR conditions, or type a QGIS expression directly
+- Loads matched features into a **reviewable checklist** — uncheck any you want to exclude before proceeding
+- Shows a live **"X of Y features"** result after each operation
+- Keeps the UI responsive during loading via chunked iteration
 
 Filters are saved per layer and restored automatically the next session.
 
@@ -32,11 +33,28 @@ Restart QField and enable the plugin from **Settings → Plugins**.
 2. Choose **Delete**, **Move** or **Copy** at the top
 3. Pick a **source layer** (and **destination layer** for Move/Copy — only layers with a matching geometry type are listed)
 4. Choose **All** to act on every feature, or **Filter** to narrow by expression:
-   - Pick a field, operator and value, then tap **Apply Filter**
-   - The expression box is filled automatically — edit it directly for complex queries
-   - Typing in the value box shows matching values from the layer as a suggestion list
-5. Tap **Execute**
-6. Review the feature count in the confirmation screen — tap **Proceed** to run or **Cancel** to go back and adjust
+   - Pick a field, operator and value
+   - Tap **Apply Filter** to set the expression, or **+ AND** / **+ OR** to append a second (or further) condition
+   - Edit the Expression box directly for complex queries
+   - Type at least 2 characters in the value box to see matching values as suggestions
+5. Tap **Execute** — the plugin loads matching features into a checklist (with a spinner while loading)
+6. In the feature list:
+   - Use **Identify by** to choose which field labels each row
+   - **Uncheck** any features you want to exclude from the operation
+   - Use **All** / **None** to select or clear everything quickly
+7. Tap **Proceed** to run, or **Cancel** to return to the main dialog unchanged
+
+## Compound filters
+
+Use **+ AND** / **+ OR** to chain multiple conditions:
+
+| Step | Action | Expression |
+|---|---|---|
+| Field=name, Op==, Value=Tom | Apply Filter | `"name" = 'Tom'` |
+| Field=species, Op=<>, Value=Cat | + AND | `("name" = 'Tom') AND "species" <> 'Cat'` |
+| Field=age, Op=>, Value=5 | + AND | `("name" = 'Tom') AND "species" <> 'Cat' AND "age" > 5` |
+
+The Expression box remains fully editable at any point.
 
 ## Filter operators
 
@@ -65,23 +83,32 @@ Restart QField and enable the plugin from **Settings → Plugins**.
 | `"edit_date" = '2026-04-18 20:18:52'` | Exact datetime match |
 | `"notes" IS NULL` | Field is empty |
 
-Tap **Help** in the dialog title bar for the full expression reference.
+Tap **Help** in the dialog title bar for the full in-app reference.
 
 ## Date and datetime fields
 
-- Values are auto-detected as date or datetime and wrapped in `to_date()` / `to_datetime()` automatically
-- `today()` with `=` on a **datetime** field is rewritten to `date("field") = today()` so the time component is ignored — features on today's date are matched correctly
+- Values are auto-detected and wrapped in `to_date()` / `to_datetime()` automatically
+- `today()` with `=` on a **datetime** field is rewritten to `date("field") = today()` so the time component is ignored — features on today's date match correctly
 - `today()` with `<` or `>` is passed through as-is
-- Type suggestions from the layer are formatted as `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` automatically
+- Typed value suggestions are formatted as `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` automatically
 
 ## Move / Copy behaviour
 
-- Only layers with the **same geometry type** (point → point, line → line, polygon → polygon) appear in the destination list — mismatches are excluded automatically
-- Fields are matched by name — fields that exist in both layers are copied; source fields with no matching name in the destination are dropped (shown in the dialog below the destination selector)
+- Only layers with the **same geometry type** (point → point, line → line, polygon → polygon) appear in the destination list
+- Fields are matched by name — fields that exist in both layers are copied; unmatched source fields are dropped (shown as **✘ dropped** in the dialog)
 
-## Performance note
+## Feature list / checklist
 
-Counting and executing may be slow on layers with very large numbers of features. Use a filter to narrow the scope where possible.
+- Up to **500** matched features are loaded into the checklist
+- If more than 500 match, a warning is shown and Proceed acts on the checked subset only — refine your filter to see more
+- Use **Identify by** to switch the label field shown for each feature (e.g. switch from `name` to `species` to identify features more clearly)
+- The result toast shows **"Deleted X of Y feature(s) from 'Layer'"** — X = checked and acted on, Y = total matched
+
+## Performance notes
+
+- The feature list loads in chunks of 25, yielding between each chunk to keep the UI responsive
+- Value suggestions only trigger when you have typed at least 2 characters, avoiding large layer scans while you are building a filter
+- Move / Copy of very large matched sets may cause a brief pause since all matched features must be iterated in sequence
 
 ## Requirements
 
