@@ -1,7 +1,7 @@
 [general]
 name=CopyMoveDeleteFeatures
-description=Filter features by expression, then copy, move or delete the selected subset between editable layers.
-author=tyhol
+description=Delete, copy or move features between editable layers. Build single or compound expressions (AND/OR) using a field/operator/value picker or type directly. Matched features load into a reviewable checklist — uncheck any to exclude before proceeding. Chunked loading keeps the UI responsive on large layers.
+author=Tony Holmes
 icon=icon.svg
-version=0.7
-homepage=https://github.com/TyHol/DeleteViaDropdown
+version=0.8
+homepage=https://github.com/TyHol/CopyMoveDeleteFeatures
