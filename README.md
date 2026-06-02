@@ -15,17 +15,6 @@ A [QField](https://qfield.org) plugin to delete, copy or move features between e
 
 Filters are saved per layer and restored automatically the next session.
 
-## Installation
-
-Copy the `CopyMoveDeleteFeatures` folder into your QField plugins directory:
-
-| Platform | Directory |
-|---|---|
-| Android | `<device>/QField/plugins/` |
-| Windows | `%APPDATA%\QField\plugins\` |
-| Linux / macOS | `~/.local/share/QField/plugins/` |
-
-Restart QField and enable the plugin from **Settings → Plugins**.
 
 ## Usage
 
