@@ -16,6 +16,10 @@ A [QField](https://qfield.org) plugin to delete, copy or move features between e
 Filters are saved per layer and restored automatically the next session.
 
 
+## Install:
+
+<img width="372" height="378" alt="image" src="https://github.com/user-attachments/assets/9fc1868d-d2b4-40fb-bf8d-9b3953bd5e7e" />
+
 ## Usage
 
 1. Tap the plugin toolbar button to open the dialog
