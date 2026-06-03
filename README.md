@@ -133,9 +133,7 @@ Tap **Help** in the dialog title bar for the full in-app reference.
 
 | Version | Notes |
 |---|---|
-| **0.6** | Async Copy and Move with live progress, cancel button, and "Finishing up…" indicator. Improved handling of large datasets — Copy runs in chunks of 100, Move in batches of 500 to reduce commit overhead. Entire-dataset path is now also async and cancellable. Filter expressions saved and restored per layer including compound AND/OR expressions. Various UI and messaging improvements. |
+| **0.6** | Copy and Move with live progress, cancel button. Improved handling of large datasets. |
 | **0.5** | Initial public release — Delete, Copy, Move with expression filter builder, compound AND/OR filters, reviewable feature checklist, review subset size control, entire-dataset action. |
 
-## Author
 
-Tony Holmes — [github.com/TyHol](https://github.com/TyHol)
