@@ -19,7 +19,7 @@ Filters are saved per layer and restored automatically the next session.
 
 ## Installation
 
-<img width="364" height="366" alt="image" src="https://github.com/user-attachments/assets/12bf8696-6357-43f4-9200-4bd11d83df70" />
+<img width="100" height="100" alt="image" src="https://github.com/user-attachments/assets/12bf8696-6357-43f4-9200-4bd11d83df70" />
 
 
 ## Usage
