@@ -15,17 +15,27 @@ Item {
 
     // Cached field type for the currently selected filter field
     property string _currentFieldType: "text"
+    // Common field name candidates for auto-labelling features
+    readonly property var _nameCandidates: ["name", "label", "desc", "description", "title"]
 
     // Total matched count set by tryExecute() — shown in the feature list dialog
     property int  _totalMatchedCount: 0
     // True when the feature list is capped and more features exist beyond it
     property bool _listTruncated:     false
-    // Guard against label-field selector rebuild triggering reloadLabels() prematurely
-    property bool _listLabelGuard:    false
     // Chunked-loading state — keeps UI responsive while building the checklist
-    property bool _isLoading:  false   // true while counting or chunk-loading
-    property var  _loadIter:   null    // active feature iterator
-    property int  _loadDone:   0       // features loaded so far
+    property bool   _isLoading:  false   // true while counting or chunk-loading checklist
+    property var    _loadIter:   null    // active feature iterator (checklist load)
+    property int    _loadDone:   0       // features loaded so far (checklist)
+    // Expression used to generate the current feature list — used by the
+    // "entire dataset" path to act beyond the loaded subset
+    property string _activeExpr: ""
+    // Async move/copy execution state
+    property bool   _isExecuting:     false  // true while move/copy is running
+    property bool   _cancelRequested: false  // set to true by Cancel button
+    property int    _progressCount:   0      // features processed so far
+    property var    _copyIter:        null   // open iterator for chunked copy
+    property string _execSrcName:     ""     // layer names held across callLater ticks
+    property string _execDstName:     ""
 
     // Feature checklist — { fid, label, checked }
     ListModel { id: featureChecklistModel }
@@ -44,6 +54,7 @@ Item {
         property string lastLayerName:     ""
         property string lastDestLayerName: ""
         property string lastModeName:      ""
+        property int    subsetCap:         500   // max features loaded into the review list
     }
 
     Component.onCompleted: {
@@ -120,6 +131,7 @@ Item {
         }
         onClosed: {
             suggestionPopup.close()
+            featureListDialog.close()        // clean up if back-button closed main first
             filterMemory.lastLayerName     = layerSelector.currentText
             filterMemory.lastDestLayerName = destLayerSelector.currentText
             filterMemory.lastModeName      = _mode
@@ -235,12 +247,6 @@ Item {
                     topPadding: 4; bottomPadding: 4
                     visible: _mode === "move" || _mode === "copy"
                     onCurrentTextChanged: updateFieldMapLabel()
-                }
-                Label {
-                    id: fieldMapLabel
-                    Layout.fillWidth: true; text: ""; wrapMode: Text.Wrap
-                    font: Theme.tipFont; color: Theme.secondaryTextColor
-                    visible: (_mode === "move" || _mode === "copy") && text !== ""
                 }
 
                 // ── Filter section (visible when Filter is selected) ───────────
@@ -392,7 +398,6 @@ Item {
                     }
 
                     // Editable expression field
-                    Label { id: exprPreviewLabel; text: ""; visible: false }
                     Label { text: qsTr("Expression (editable):"); font: Theme.tipFont; color: Theme.secondaryTextColor }
                     TextField {
                         id: exprField
@@ -406,11 +411,48 @@ Item {
                     // Performance note
                     Label {
                         Layout.fillWidth: true
-                        text: qsTr("⚠ Note: may be slow with large numbers of features.")
+                        text: qsTr("!! Note: may be slow with large numbers of features.")
                         font: Theme.tipFont; color: Theme.secondaryTextColor
                         wrapMode: Text.Wrap; opacity: 0.8
                     }
                 }   // end filter section
+
+                // ── Field map (moved here so filter boxes stay visible) ───────
+                Label {
+                    id: fieldMapLabel
+                    Layout.fillWidth: true; text: ""; wrapMode: Text.Wrap
+                    font: Theme.tipFont; color: Theme.secondaryTextColor
+                    visible: (_mode === "move" || _mode === "copy") && text !== ""
+                }
+
+                // ── Review subset (scrollable, bottom of content) ─────────────
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Review subset (recommended when copying/moving large datasets):")
+                        font: Theme.tipFont
+                        color: Theme.secondaryTextColor
+                        wrapMode: Text.Wrap
+                        opacity: 0.8
+                    }
+                    ComboBox {
+                        id: subsetCapSelector
+                        font: Theme.tipFont
+                        topPadding: 4; bottomPadding: 4
+                        model: ["50", "100", "200", "500", "1000", "2000", "5000"]
+                        Component.onCompleted: {
+                            var vals = [50, 100, 200, 500, 1000, 2000, 5000]
+                            var idx = vals.indexOf(filterMemory.subsetCap)
+                            currentIndex = idx >= 0 ? idx : 3
+                        }
+                        onCurrentIndexChanged: {
+                            var vals = [50, 100, 200, 500, 1000, 2000, 5000]
+                            filterMemory.subsetCap = vals[currentIndex]
+                        }
+                    }
+                }
 
             }   // end inner ColumnLayout
         }   // end ScrollView
@@ -424,20 +466,33 @@ Item {
             Layout.leftMargin: 2
             Layout.rightMargin: 2
 
-            // Loading indicator — visible while counting / building the feature list
+
+            // ── Loading indicator (checklist building) ────────────────────
             RowLayout {
                 Layout.fillWidth: true
                 visible: _isLoading
                 spacing: 8
-                BusyIndicator {
-                    running: _isLoading
-                    implicitWidth: 28; implicitHeight: 28
-                }
+                BusyIndicator { running: _isLoading; implicitWidth: 28; implicitHeight: 28 }
                 Label {
                     text: qsTr("Loading features…")
-                    font: Theme.tipFont
-                    color: Theme.secondaryTextColor
+                    font: Theme.tipFont; color: Theme.secondaryTextColor; Layout.fillWidth: true
+                }
+            }
+
+            // ── Execution progress (move/copy in progress) ────────────────
+            RowLayout {
+                Layout.fillWidth: true
+                visible: _isExecuting
+                spacing: 8
+                BusyIndicator { running: _isExecuting; implicitWidth: 28; implicitHeight: 28 }
+                Label {
                     Layout.fillWidth: true
+                    font: Theme.tipFont; color: Theme.secondaryTextColor; wrapMode: Text.Wrap
+                    text: _cancelRequested
+                          ? qsTr("Cancelling — finishing current batch…")
+                          : _mode === "move"
+                            ? qsTr("Moving: %1 features complete…").arg(_progressCount)
+                            : qsTr("Copying: %1 features complete…").arg(_progressCount)
                 }
             }
 
@@ -445,18 +500,24 @@ Item {
                 Layout.fillWidth: true
                 spacing: 6
                 Button {
-                    text: qsTr("Cancel")
                     Layout.fillWidth: true
                     font: Theme.defaultFont
                     enabled: !_isLoading
-                    onClicked: { _loadIter = null; _isLoading = false; mainDialog.close() }
+                    text: _isExecuting ? qsTr("Cancel operation") : qsTr("Cancel")
+                    onClicked: {
+                        if (_isExecuting) {
+                            _cancelRequested = true   // honoured at next batch boundary
+                        } else {
+                            _loadIter = null; _isLoading = false; mainDialog.close()
+                        }
+                    }
                 }
                 Button {
                     text: _isLoading ? qsTr("Working…") : qsTr("Execute")
                     Layout.fillWidth: true
                     highlighted: true
                     font: Theme.defaultFont
-                    enabled: !_isLoading
+                    enabled: !_isLoading && !_isExecuting
                     onClicked: tryExecute()
                 }
             }
@@ -468,7 +529,7 @@ Item {
     // ── Feature list dialog ───────────────────────────────────────────────────
     // Opens after Execute. Shows matched features as a checklist so the user
     // can deselect individual features before proceeding.
-    // Capped at 500 — a truncation warning is shown if more features exist.
+    // Capped at the review subset size — an "entire dataset" button appears when truncated.
     Dialog {
         id: featureListDialog
         parent: mainWindow.contentItem
@@ -493,15 +554,13 @@ Item {
                 font: Theme.tipFont
                 color: _listTruncated ? "#e67e22" : Theme.mainTextColor
                 text: {
-                    var shown = featureChecklistModel.count
-                    var total = _totalMatchedCount
-                    // total = 501 means "more than 500 matched" (count was capped)
-                    var totalStr = total > 500 ? qsTr("500+") : String(total)
+                    var shown  = featureChecklistModel.count
+                    var cap    = filterMemory.subsetCap
                     if (_listTruncated)
-                        return qsTr("!! Showing first %1 of %2 matched features. " +
-                                    "Refine your filter to see more. " +
-                                    "Proceed acts on checked features only.")
-                               .arg(shown).arg(totalStr)
+                        return qsTr("!! Only the first %1 features are loaded (your review " +
+                                    "subset). The full matched set is larger. Use the buttons " +
+                                    "below to act on this subset or the entire dataset.")
+                               .arg(cap)
                     return qsTr("%1 feature(s) matched. Deselect any to exclude.")
                                .arg(shown)
                 }
@@ -535,9 +594,9 @@ Item {
                     font: Theme.tipFont
                     topPadding: 4; bottomPadding: 4
                     model: ["(auto)"]
-                    onCurrentTextChanged: {
-                        if (!_listLabelGuard) reloadListLabels()
-                    }
+                    // onActivated fires only when the user picks from the dropdown —
+                    // not during programmatic model/index changes, so no guard needed.
+                    onActivated: reloadListLabels()
                 }
             }
 
@@ -596,7 +655,7 @@ Item {
                 }
             }
 
-            // ── Proceed / Cancel ──────────────────────────────────────────────
+            // ── Proceed (review subset) / Cancel ──────────────────────────────
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 6
@@ -605,10 +664,45 @@ Item {
                     onClicked: featureListDialog.reject()   // back to main dialog
                 }
                 Button {
-                    text: qsTr("Proceed"); Layout.fillWidth: true
+                    // Only show mode-specific label when list is truncated —
+                    // otherwise "Proceed" is unambiguous.
+                    text: _listTruncated
+                          ? (_mode === "delete" ? qsTr("Delete from review subset")
+                             : _mode === "move" ? qsTr("Move from review subset")
+                             : qsTr("Copy from review subset"))
+                          : qsTr("Proceed")
+                    Layout.fillWidth: true
                     highlighted: true; font: Theme.defaultFont
                     onClicked: featureListDialog.accept()
                 }
+            }
+
+            // ── Entire dataset button — only when list is truncated ───────────
+            Button {
+                id: entireDatasetBtn
+                Layout.fillWidth: true
+                visible: _listTruncated
+                font: Theme.defaultFont
+                text: _mode === "delete"
+                      ? qsTr("Delete from entire dataset")
+                      : _mode === "move"
+                        ? qsTr("Move from entire dataset — not recommended")
+                        : qsTr("Copy from entire dataset — not recommended")
+                // Red for delete, amber for move/copy
+                background: Rectangle {
+                    radius: 4
+                    color: _mode === "delete"
+                           ? Qt.rgba(0.75, 0.15, 0.15, 0.9)
+                           : Qt.rgba(0.80, 0.45, 0.05, 0.9)
+                }
+                contentItem: Text {
+                    text: entireDatasetBtn.text; font: entireDatasetBtn.font
+                    color: "white"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment:   Text.AlignVCenter
+                    wrapMode: Text.Wrap
+                }
+                onClicked: entireDatasetConfirmDialog.open()
             }
         }
 
@@ -631,34 +725,102 @@ Item {
                 saveLayerFilter(layerSelector.currentText)
 
             // Act only on the checked feature IDs
-            var expr        = "$id IN (" + ids.join(",") + ")"
-            var selectedN   = ids.length
-            var shownN      = featureChecklistModel.count
-            var totalN      = _totalMatchedCount
-            // Build "X of Y" string — omit "of Y" when all shown features are selected
-            var totalStr    = totalN > 500 ? qsTr("500+") : String(totalN)
-            var countLabel  = (selectedN === shownN && !_listTruncated)
-                              ? String(selectedN)
-                              : qsTr("%1 of %2").arg(selectedN).arg(totalStr)
+            var expr       = "$id IN (" + ids.join(",") + ")"
+            var selectedN  = ids.length
+            var cap        = filterMemory.subsetCap
+            var totalN     = _totalMatchedCount
+            var totalStr   = totalN > cap ? qsTr("%1+").arg(cap) : String(totalN)
+            var countLabel = (selectedN === featureChecklistModel.count && !_listTruncated)
+                             ? String(selectedN)
+                             : qsTr("%1 of %2").arg(selectedN).arg(totalStr)
 
             if (_mode === "move" || _mode === "copy") {
-                var dstLayer = getLayerByName(destLayerSelector.currentText)
-                if (!dstLayer) return
-                var moved = directCopyMoveByExpression(srcLayer, dstLayer, expr, _mode === "move")
-                if (moved > 0) {
-                    var verb = _mode === "move" ? qsTr("Moved") : qsTr("Copied")
-                    mainWindow.displayToast(
-                        qsTr("%1 %2 feature(s) from '%3' → '%4'")
-                            .arg(verb).arg(countLabel).arg(srcLayer.name).arg(dstLayer.name))
-                }
+                // Use async batched execution — closes both dialogs and shows
+                // progress in the main dialog footer
+                featureListDialog.close()
+                if (_mode === "move")
+                    startBatchMove(srcLayer.name, destLayerSelector.currentText, expr)
+                else
+                    startBatchCopy(srcLayer.name, destLayerSelector.currentText, expr)
             } else {
                 var ok = directDeleteByExpression(srcLayer, expr)
                 if (ok)
                     mainWindow.displayToast(
                         qsTr("Deleted %1 feature(s) from '%2'")
                             .arg(countLabel).arg(srcLayer.name))
+                mainDialog.close()
             }
-            mainDialog.close()
+        }
+    }
+
+    // ── Entire dataset confirm dialog ─────────────────────────────────────────
+    // Shown when the user taps "Delete/Move/Copy from entire dataset".
+    // Acts on _activeExpr (the original filter expression) with no cap.
+    Dialog {
+        id: entireDatasetConfirmDialog
+        parent: mainWindow.contentItem
+        modal: true
+        font: Theme.defaultFont
+        standardButtons: Dialog.NoButton
+        anchors.centerIn: parent
+        width: Math.min(mainWindow.width * 0.9, 420)
+        title: _mode === "delete" ? qsTr("Delete from entire dataset")
+             : _mode === "move"   ? qsTr("Move from entire dataset")
+             : qsTr("Copy from entire dataset")
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 12
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                font: Theme.tipFont
+                color: Theme.mainTextColor
+                text: {
+                    var warn = (_mode === "move" || _mode === "copy")
+                               ? "\n\n" + qsTr("!! This may take a long time or cause the " +
+                                               "app to pause on large datasets.")
+                               : ""
+                    return qsTr("This operation cannot be undone. Proceed?") + warn
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Button {
+                    text: qsTr("Cancel"); Layout.fillWidth: true; font: Theme.defaultFont
+                    onClicked: entireDatasetConfirmDialog.reject()
+                }
+                Button {
+                    text: qsTr("Proceed"); Layout.fillWidth: true
+                    highlighted: true; font: Theme.defaultFont
+                    onClicked: entireDatasetConfirmDialog.accept()
+                }
+            }
+        }
+
+        onAccepted: {
+            var srcLayer = getLayerByName(layerSelector.currentText)
+            if (!srcLayer) return
+
+            if (_mode === "move" || _mode === "copy") {
+                // Use async batch path — progress shown in main dialog footer
+                entireDatasetConfirmDialog.close()
+                featureListDialog.close()
+                if (_mode === "move")
+                    startBatchMove(srcLayer.name, destLayerSelector.currentText, _activeExpr)
+                else
+                    startBatchCopy(srcLayer.name, destLayerSelector.currentText, _activeExpr)
+            } else {
+                var ok = directDeleteByExpression(srcLayer, _activeExpr)
+                if (ok)
+                    mainWindow.displayToast(
+                        qsTr("Deleted all matching features from '%1'").arg(srcLayer.name))
+                featureListDialog.close()
+                mainDialog.close()
+            }
         }
     }
 
@@ -674,9 +836,7 @@ Item {
         if ((_mode === "move" || _mode === "copy") && !destLayerSelector.currentText) {
             mainWindow.displayToast(qsTr("No compatible destination layer — must match source geometry type.")); return
         }
-        if (_useFilter && exprField.text.trim() === "") {
-            mainWindow.displayToast(qsTr("Enter a filter expression or switch to All.")); return
-        }
+        // Empty filter expression = act on all features (same as All mode)
         _isLoading = true
         // Yield one tick so the spinner and "Working…" button appear before we block
         Qt.callLater(doExecute)
@@ -691,6 +851,7 @@ Item {
 
         var n = countMatchingFeatures(srcLayer, expr)
         _totalMatchedCount = n
+
         if (n === 0) {
             _isLoading = false
             mainWindow.displayToast(qsTr("No features matched — nothing to do."))
@@ -702,18 +863,17 @@ Item {
     // Initialise the chunked feature load — builds label selector, creates the
     // iterator and schedules the first chunk.
     function startChunkedLoad(layer, expr) {
+        _activeExpr = expr          // store for the "entire dataset" path
         featureChecklistModel.clear()
         _listTruncated = false
         _loadDone = 0
 
-        // Rebuild label-field selector without triggering reloadListLabels()
-        _listLabelGuard = true
+        // Rebuild label-field selector (onActivated won't fire for programmatic changes)
         var fieldNames = []
         try { fieldNames = layer.fields.names ? layer.fields.names.slice() : [] } catch(e) {}
         fieldNames.sort()
         listLabelSelector.model = ["(auto)"].concat(fieldNames)
         listLabelSelector.currentIndex = 0
-        _listLabelGuard = false
 
         try {
             _loadIter = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
@@ -731,8 +891,8 @@ Item {
         if (!_isLoading || !_loadIter) { _loadIter = null; _isLoading = false; return }
 
         var CHUNK = 25
-        var CAP   = 500
-        var nameCandidates = ["name", "label", "desc", "description", "title"]
+        var CAP   = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        var nameCandidates = _nameCandidates
 
         try {
             var i = 0
@@ -741,7 +901,9 @@ Item {
                 var fid = null
                 try { fid = (typeof f.id === "function") ? f.id() : f.id } catch(e) {}
 
-                var label = qsTr("Feature %1").arg(fid !== null ? fid : _loadDone + 1)
+                // Always use the load counter as the fallback label — fids can be
+                // negative (e.g. QField temporary IDs) which looks confusing.
+                var label = qsTr("Feature %1").arg(_loadDone + 1)
                 for (var nc = 0; nc < nameCandidates.length; nc++) {
                     try {
                         var v = f.attribute(nameCandidates[nc])
@@ -773,27 +935,29 @@ Item {
     }
 
     // Re-label the checklist when the user changes the label-field selector.
+    // Uses position-based matching (index) rather than fid lookup — avoids
+    // type-mismatch issues with QML/JS integer representations across the boundary.
+    // Uses _activeExpr (the expression actually used to load the list) so the
+    // iterator returns features in exactly the same order as the original load.
     function reloadListLabels() {
+        if (featureChecklistModel.count === 0) return
         var layer = getLayerByName(layerSelector.currentText)
-        if (!layer || featureChecklistModel.count === 0) return
+        if (!layer) return
 
-        var chosen  = listLabelSelector.currentText
-        var useAuto = (!chosen || chosen === "(auto)")
-        var nameCandidates = ["name", "label", "desc", "description", "title"]
-        var expr = (_useFilter && exprField.text.trim() !== "") ? exprField.text.trim() : "1=1"
+        var chosen         = listLabelSelector.currentText
+        var useAuto        = (!chosen || chosen === "(auto)")
+        var nameCandidates = _nameCandidates
+        var cap            = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        var expr           = _activeExpr !== "" ? _activeExpr : "1=1"
 
-        // Build fid → label map from a fresh iterator pass
-        var labelMap = {}
-        var scanned  = 0
+        // Collect labels in iterator order (same order features were originally loaded)
+        var newLabels = []
         try {
-            var it = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
-            while (it.hasNext() && scanned < 500) {
-                var f = it.next()
-                var fid = null
-                try { fid = (typeof f.id === "function") ? f.id() : f.id } catch(e) {}
-                if (fid === null) { scanned++; continue }
-
-                var lbl = qsTr("Feature %1").arg(fid)
+            var it      = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
+            var scanned = 0
+            while (it.hasNext() && scanned < cap) {
+                var f   = it.next()
+                var lbl = qsTr("Feature %1").arg(scanned + 1)
                 if (useAuto) {
                     for (var nc = 0; nc < nameCandidates.length; nc++) {
                         try {
@@ -810,24 +974,23 @@ Item {
                             lbl = String(cv).trim()
                     } catch(e) {}
                 }
-                labelMap[fid] = lbl
+                newLabels.push(lbl)
                 scanned++
             }
         } catch(e) {}
 
-        for (var i = 0; i < featureChecklistModel.count; i++) {
-            var item = featureChecklistModel.get(i)
-            if (labelMap[item.fid] !== undefined)
-                featureChecklistModel.setProperty(i, "label", labelMap[item.fid])
+        // Update model by index — position i in the iterator = position i in the model
+        for (var i = 0; i < featureChecklistModel.count && i < newLabels.length; i++) {
+            featureChecklistModel.setProperty(i, "label", newLabels[i])
         }
     }
 
     // Count features matching expr.
-    // Caps at 501 — just enough to know whether we exceed the 500-item checklist
-    // limit, without iterating through thousands of features unnecessarily.
-    // Returns 501 to signal "more than 500".
+    // Caps at subsetCap+1 — just enough to detect whether the list will be
+    // truncated, without iterating thousands of features unnecessarily.
     function countMatchingFeatures(layer, expr) {
         if (!layer) return 0
+        var cap = (filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500)
         // Fast path: entire layer, no filter
         if (expr === "1=1") {
             try {
@@ -836,11 +999,11 @@ Item {
                 if (typeof fc === "number" && fc >= 0) return fc
             } catch(e) {}
         }
-        // Filtered: iterate up to 501 only
+        // Filtered: iterate up to cap+1 only
         var count = 0
         try {
             var it = LayerUtils.createFeatureIteratorFromExpression(layer, expr)
-            while (it.hasNext() && count <= 500) { it.next(); count++ }
+            while (it.hasNext() && count <= cap) { it.next(); count++ }
         } catch(e) { return 0 }
         return count
     }
@@ -885,7 +1048,8 @@ Item {
         filters[layerName] = {
             field: fieldSelector.currentText,
             op:    operatorSelector.currentText,
-            value: valueField.text
+            value: valueField.text,
+            expr:  exprField.text   // also save the raw expression for direct-entry filters
         }
         filterMemory.layerFilters = JSON.stringify(filters)
     }
@@ -896,8 +1060,7 @@ Item {
         try { filters = JSON.parse(filterMemory.layerFilters) } catch(e) {}
         delete filters[layerName]
         filterMemory.layerFilters = JSON.stringify(filters)
-        exprPreviewLabel.text = ""
-        exprField.text        = ""
+        exprField.text = ""
     }
 
     // Restore saved filter for this layer and rebuild the expression field.
@@ -925,10 +1088,13 @@ Item {
 
         valueField.text = saved.value || ""
 
-        var expr = buildExpression()
-        if (expr) {
-            exprPreviewLabel.text = expr
-            exprField.text        = expr
+        // Restore the raw expression — prefer the saved expr (covers direct-entry filters);
+        // fall back to rebuilding from field/op/value if not saved.
+        if (saved.expr) {
+            exprField.text = saved.expr
+        } else {
+            var built = buildExpression()
+            if (built) exprField.text = built
         }
     }
 
@@ -957,7 +1123,7 @@ Item {
                        : srcGt === Qgis.GeometryType.Line    ? qsTr("line")
                        : srcGt === Qgis.GeometryType.Polygon ? qsTr("polygon")
                        : qsTr("same geometry type")
-            fieldMapLabel.text = qsTr("⚠ No editable %1 layers found to copy/move into.").arg(gtName)
+            fieldMapLabel.text = qsTr("!! No editable %1 layers found to copy/move into.").arg(gtName)
         }
         updateFieldMapLabel()
     }
@@ -979,8 +1145,8 @@ Item {
             else unmapped.push(srcNames[i])
         }
         var parts = []
-        if (mapped.length > 0)   parts.push(qsTr("✔ mapped: ") + mapped.join(", "))
-        if (unmapped.length > 0) parts.push(qsTr("✘ dropped: ") + unmapped.join(", "))
+        if (mapped.length > 0)   parts.push(qsTr("[OK] mapped: ") + mapped.join(", "))
+        if (unmapped.length > 0) parts.push(qsTr("[X] dropped: ") + unmapped.join(", "))
         fieldMapLabel.text = parts.join("\n")
     }
 
@@ -1027,12 +1193,13 @@ Item {
         function fromDate(d) {
             if (isNaN(d.getTime())) return null
             var y  = d.getFullYear()
-            var mo = String(d.getMonth() + 1).padStart(2, "0")
-            var dy = String(d.getDate()).padStart(2, "0")
+            function pad2(n) { return (n < 10 ? "0" + n : String(n)) }
+            var mo = pad2(d.getMonth() + 1)
+            var dy = pad2(d.getDate())
             if (!keepTime) return y + "-" + mo + "-" + dy
-            var h  = String(d.getHours()).padStart(2, "0")
-            var mi = String(d.getMinutes()).padStart(2, "0")
-            var s  = String(d.getSeconds()).padStart(2, "0")
+            var h  = pad2(d.getHours())
+            var mi = pad2(d.getMinutes())
+            var s  = pad2(d.getSeconds())
             return y + "-" + mo + "-" + dy + " " + h + ":" + mi + ":" + s
         }
         if (val instanceof Date) return fromDate(val)
@@ -1061,16 +1228,12 @@ Item {
         var searchText = valueField.text.trim()
         if (/^\w+\s*\(/.test(searchText)) return
 
+        // Suggestions only fire after 2+ chars typed, so searchText is always non-empty here
         var fieldType  = _currentFieldType
         var isDateType = fieldType === "date" || fieldType === "datetime" || fieldType === "time"
-        var iterExpr
-        if (searchText === "") {
-            iterExpr = '"' + field + '" IS NOT NULL'
-        } else if (isDateType) {
-            iterExpr = 'to_string(date("' + field + '")) ILIKE \'%' + searchText.replace(/'/g, "''") + '%\''
-        } else {
-            iterExpr = 'to_string("' + field + '") ILIKE \'%' + searchText.replace(/'/g, "''") + '%\''
-        }
+        var iterExpr   = isDateType
+            ? 'to_string(date("' + field + '")) ILIKE \'%' + searchText.replace(/'/g, "''") + '%\''
+            : 'to_string("' + field + '") ILIKE \'%' + searchText.replace(/'/g, "''") + '%\''
         var seen = {}, values = []
         try {
             var it = LayerUtils.createFeatureIteratorFromExpression(layer, iterExpr)
@@ -1184,6 +1347,203 @@ Item {
         saveLayerFilter(layerSelector.currentText)
     }
 
+    // ── Async Move — batch loop ───────────────────────────────────────────────
+    // Re-runs the expression each batch. Safe because deleted features disappear
+    // from future iterator results. Yields between batches via callLater.
+    function startBatchMove(srcName, dstName, expr) {
+        _isExecuting     = true
+        _cancelRequested = false
+        _progressCount   = 0
+        _execSrcName     = srcName
+        _execDstName     = dstName
+        Qt.callLater(function() { processMoveNextBatch(expr) })
+    }
+
+    function processMoveNextBatch(expr) {
+        if (_cancelRequested) {
+            _isExecuting = false
+            mainWindow.displayToast(
+                qsTr("Cancelled — %1 feature(s) moved.").arg(_progressCount))
+            mainDialog.close(); return
+        }
+        var srcLayer = getLayerByName(_execSrcName)
+        var dstLayer = getLayerByName(_execDstName)
+        if (!srcLayer || !dstLayer) { _isExecuting = false; return }
+
+        var batchSize = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        var features  = []
+        try {
+            var it = LayerUtils.createFeatureIteratorFromExpression(srcLayer, expr)
+            var n  = 0
+            while (it.hasNext() && n < batchSize) { features.push(it.next()); n++ }
+        } catch(e) {
+            _isExecuting = false
+            mainWindow.displayToast(qsTr("Error reading features: %1").arg(e.toString()))
+            return
+        }
+
+        if (features.length === 0) {
+            _isExecuting = false
+            mainWindow.displayToast(
+                qsTr("Moved %1 feature(s): '%2' -> '%3'")
+                    .arg(_progressCount).arg(_execSrcName).arg(_execDstName))
+            mainDialog.close(); return
+        }
+
+        var written = writeBatchToLayer(features, srcLayer, dstLayer)
+
+        if (written > 0) {
+            var ids = []
+            for (var i = 0; i < features.length; i++) {
+                try { ids.push((typeof features[i].id === "function")
+                                ? features[i].id() : features[i].id) } catch(e) {}
+            }
+            try {
+                if (!srcLayer.isEditable) srcLayer.startEditing()
+                srcLayer.selectByExpression("$id IN (" + ids.join(",") + ")")
+                srcLayer.deleteSelectedFeatures()
+                srcLayer.commitChanges()
+                srcLayer.triggerRepaint()
+            } catch(e) {
+                try { srcLayer.rollBack() } catch(e2) {}
+                mainWindow.displayToast(qsTr("Source delete error: %1").arg(e.toString()))
+            }
+        }
+        _progressCount += written
+        Qt.callLater(function() { processMoveNextBatch(expr) })
+    }
+
+    // ── Async Copy — single open iterator, chunked writes ─────────────────────
+    // Keeps one iterator open across callLater ticks — re-running the expression
+    // would copy the same features again (duplicates), so single iterator avoids that.
+    function startBatchCopy(srcName, dstName, expr) {
+        _isExecuting     = true
+        _cancelRequested = false
+        _progressCount   = 0
+        _execSrcName     = srcName
+        _execDstName     = dstName
+
+        var srcLayer = getLayerByName(srcName)
+        var dstLayer = getLayerByName(dstName)
+        if (!srcLayer || !dstLayer) { _isExecuting = false; return }
+
+        try {
+            _copyIter = LayerUtils.createFeatureIteratorFromExpression(srcLayer, expr)
+        } catch(e) {
+            _isExecuting = false
+            mainWindow.displayToast(qsTr("Error reading features: %1").arg(e.toString()))
+            return
+        }
+        moveFeatureModel.currentLayer = dstLayer
+        moveFeatureModel.batchMode    = true
+        Qt.callLater(processCopyNextChunk)
+    }
+
+    function processCopyNextChunk() {
+        if (_cancelRequested || !_copyIter) {
+            moveFeatureModel.batchMode = false
+            _copyIter    = null
+            _isExecuting = false
+            mainWindow.displayToast(_cancelRequested
+                ? qsTr("Cancelled — %1 feature(s) copied.").arg(_progressCount)
+                : qsTr("Copied %1 feature(s): '%2' -> '%3'")
+                      .arg(_progressCount).arg(_execSrcName).arg(_execDstName))
+            mainDialog.close(); return
+        }
+
+        var srcLayer = getLayerByName(_execSrcName)
+        var dstLayer = getLayerByName(_execDstName)
+        if (!srcLayer || !dstLayer) {
+            moveFeatureModel.batchMode = false; _copyIter = null; _isExecuting = false; return
+        }
+
+        var dstFieldNames = []
+        try { dstFieldNames = dstLayer.fields.names || [] } catch(e) {}
+        var dstFieldIdx = {}
+        for (var fi = 0; fi < dstFieldNames.length; fi++)
+            dstFieldIdx[dstFieldNames[fi]] = fi
+        var srcFieldNames = []
+        try { srcFieldNames = srcLayer.fields.names || [] } catch(e) {}
+
+        var CHUNK   = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        var written = 0
+        var hasMore = false
+
+        try {
+            var i = 0
+            while (i < CHUNK && _copyIter.hasNext()) {
+                var srcFeat = _copyIter.next()
+                var geom    = srcFeat.geometry
+                if (!geom) { i++; continue }
+                var newFeat = FeatureUtils.createBlankFeature(dstLayer.fields, geom)
+                for (var si = 0; si < srcFieldNames.length; si++) {
+                    var fname = srcFieldNames[si]
+                    if (dstFieldIdx[fname] === undefined) continue
+                    var av = null
+                    try { av = srcFeat.attribute(fname) } catch(e) {}
+                    if (av !== null && av !== undefined)
+                        newFeat.setAttribute(dstFieldIdx[fname], av)
+                }
+                moveFeatureModel.feature = newFeat
+                if (moveFeatureModel.create()) written++
+                i++
+            }
+            hasMore = _copyIter.hasNext()
+        } catch(e) {
+            moveFeatureModel.batchMode = false; _copyIter = null; _isExecuting = false
+            mainWindow.displayToast(qsTr("Error writing features: %1").arg(e.toString()))
+            return
+        }
+
+        _progressCount += written
+
+        if (!hasMore) {
+            moveFeatureModel.batchMode = false
+            _copyIter    = null
+            _isExecuting = false
+            mainWindow.displayToast(
+                qsTr("Copied %1 feature(s): '%2' -> '%3'")
+                    .arg(_progressCount).arg(_execSrcName).arg(_execDstName))
+            mainDialog.close(); return
+        }
+        Qt.callLater(processCopyNextChunk)
+    }
+
+    // ── Shared: write a batch of features into dstLayer ───────────────────────
+    function writeBatchToLayer(features, srcLayer, dstLayer) {
+        var dstFieldNames = []
+        try { dstFieldNames = dstLayer.fields.names || [] } catch(e) {}
+        var dstFieldIdx = {}
+        for (var fi = 0; fi < dstFieldNames.length; fi++)
+            dstFieldIdx[dstFieldNames[fi]] = fi
+        var srcFieldNames = []
+        try { srcFieldNames = srcLayer.fields.names || [] } catch(e) {}
+
+        moveFeatureModel.currentLayer = dstLayer
+        moveFeatureModel.batchMode    = true
+        var written = 0
+        for (var i = 0; i < features.length; i++) {
+            try {
+                var srcFeat = features[i]
+                var geom    = srcFeat.geometry
+                if (!geom) continue
+                var newFeat = FeatureUtils.createBlankFeature(dstLayer.fields, geom)
+                for (var si = 0; si < srcFieldNames.length; si++) {
+                    var fname = srcFieldNames[si]
+                    if (dstFieldIdx[fname] === undefined) continue
+                    var av = null
+                    try { av = srcFeat.attribute(fname) } catch(e) {}
+                    if (av !== null && av !== undefined)
+                        newFeat.setAttribute(dstFieldIdx[fname], av)
+                }
+                moveFeatureModel.feature = newFeat
+                if (moveFeatureModel.create()) written++
+            } catch(e) { iface.logMessage("writeBatchToLayer error: " + e) }
+        }
+        moveFeatureModel.batchMode = false
+        return written
+    }
+
     // ── Execute: delete ALL features matching expr ────────────────────────────
     function directDeleteByExpression(layer, expr) {
         try {
@@ -1203,83 +1563,6 @@ Item {
             try { layer.rollBack() } catch(e2) {}
             mainWindow.displayToast(qsTr("Error: %1").arg(e.toString()))
             return false
-        }
-    }
-
-    // ── Execute: copy/move ALL features matching expr ─────────────────────────
-    function directCopyMoveByExpression(srcLayer, dstLayer, expr, deleteSource) {
-        var features = []
-        try {
-            var it = LayerUtils.createFeatureIteratorFromExpression(srcLayer, expr)
-            while (it.hasNext()) features.push(it.next())
-        } catch(e) {
-            mainWindow.displayToast(qsTr("Could not read features: %1").arg(e.toString()))
-            return -1
-        }
-        if (features.length === 0) {
-            mainWindow.displayToast(qsTr("No features matched."))
-            return 0
-        }
-
-        var dstFieldNames = []
-        try { dstFieldNames = dstLayer.fields.names || [] } catch(e) {}
-        var dstFieldIdx = {}
-        for (var fi = 0; fi < dstFieldNames.length; fi++)
-            dstFieldIdx[dstFieldNames[fi]] = fi
-
-        var srcFieldNames = []
-        try { srcFieldNames = srcLayer.fields.names || [] } catch(e) {}
-
-        moveFeatureModel.currentLayer = dstLayer
-        moveFeatureModel.batchMode = true
-        var written = 0
-
-        for (var i = 0; i < features.length; i++) {
-            try {
-                var srcFeat = features[i]
-                var geom = srcFeat.geometry
-                if (!geom) continue
-                var newFeat = FeatureUtils.createBlankFeature(dstLayer.fields, geom)
-                for (var si = 0; si < srcFieldNames.length; si++) {
-                    var fname = srcFieldNames[si]
-                    if (dstFieldIdx[fname] === undefined) continue
-                    var attrVal = null
-                    try { attrVal = srcFeat.attribute(fname) } catch(e) {}
-                    if (attrVal !== null && attrVal !== undefined)
-                        newFeat.setAttribute(dstFieldIdx[fname], attrVal)
-                }
-                moveFeatureModel.feature = newFeat
-                if (moveFeatureModel.create()) written++
-            } catch(e) {
-                iface.logMessage("directCopyMove feature error: " + e)
-            }
-        }
-        moveFeatureModel.batchMode = false
-
-        if (written === 0) {
-            mainWindow.displayToast(qsTr("No features could be written to destination."))
-            return 0
-        }
-
-        if (!deleteSource) return written
-
-        try {
-            if (!srcLayer.isEditable) srcLayer.startEditing()
-            srcLayer.selectByExpression(expr)
-            srcLayer.triggerRepaint()
-            var ok = srcLayer.deleteSelectedFeatures()
-            if (ok) {
-                srcLayer.commitChanges(); srcLayer.triggerRepaint()
-                return written
-            }
-            srcLayer.rollBack()
-            mainWindow.displayToast(
-                qsTr("Copied %1 to destination but could not delete from source.").arg(written))
-            return written
-        } catch(e) {
-            try { srcLayer.rollBack() } catch(e2) {}
-            mainWindow.displayToast(qsTr("Source delete error: %1").arg(e.toString()))
-            return written
         }
     }
 
@@ -1356,10 +1639,10 @@ Item {
                         "• today() with = on a datetime field is automatically rewritten " +
                         "to date(\"field\") = today() so the time component is ignored.\n\n" +
                         "• For Move and Copy: only layers with a matching geometry type " +
-                        "(point → point, line → line, polygon → polygon) appear in the " +
+                        "(point -> point, line -> line, polygon -> polygon) appear in the " +
                         "destination list. Fields are matched by name — unmatched source " +
-                        "fields are dropped (shown as ✘ dropped below the selector).\n\n" +
-                        "• ⚠ Performance: the feature list loads in small chunks to keep " +
+                        "fields are dropped (shown as [X] dropped below the selector).\n\n" +
+                        "• !! Performance: the feature list loads in small chunks to keep " +
                         "the UI responsive, but executing Move or Copy on very large " +
                         "matched sets may still cause a pause. Use a filter to narrow " +
                         "the scope where possible.\n\n" +
