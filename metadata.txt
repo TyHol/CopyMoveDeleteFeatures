@@ -1,7 +1,7 @@
 [general]
 name=CopyMoveDeleteFeatures
-description=Delete, copy or move features between editable layers. Build single or compound expressions (AND/OR) using a field/operator/value picker or type directly. Matched features load into a reviewable checklist — uncheck any to exclude before proceeding. Chunked loading keeps the UI responsive on large layers.
+description=Delete, copy or move features between editable layers. Build single or compound expressions (AND/OR) using a field/operator/value picker or type directly. Matched features load into a reviewable checklist — uncheck any to exclude before proceeding. Copy and Move run asynchronously in batches with a live progress indicator and cancel button. New FIDs are always assigned on copy/move — no duplicate-check or upsert is performed.
 author=Tony Holmes
 icon=icon.svg
-version=0.5
+version=0.6
 homepage=https://github.com/TyHol/CopyMoveDeleteFeatures

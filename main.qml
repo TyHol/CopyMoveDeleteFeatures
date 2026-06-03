@@ -32,6 +32,7 @@ Item {
     // Async move/copy execution state
     property bool   _isExecuting:     false  // true while move/copy is running
     property bool   _cancelRequested: false  // set to true by Cancel button
+    property bool   _isFinalising:    false  // true while batchMode=false commit runs
     property int    _progressCount:   0      // features processed so far
     property var    _copyIter:        null   // open iterator for chunked copy
     property string _execSrcName:     ""     // layer names held across callLater ticks
@@ -488,11 +489,13 @@ Item {
                 Label {
                     Layout.fillWidth: true
                     font: Theme.tipFont; color: Theme.secondaryTextColor; wrapMode: Text.Wrap
-                    text: _cancelRequested
-                          ? qsTr("Cancelling — finishing current batch…")
-                          : _mode === "move"
-                            ? qsTr("Moving: %1 features complete…").arg(_progressCount)
-                            : qsTr("Copying: %1 features complete…").arg(_progressCount)
+                    text: _isFinalising
+                          ? qsTr("Finishing up — please wait…")
+                          : _cancelRequested
+                            ? qsTr("Cancelling — finishing current batch…")
+                            : _mode === "move"
+                              ? qsTr("Moving: %1 features complete…").arg(_progressCount)
+                              : qsTr("Copying: %1 features complete…").arg(_progressCount)
                 }
             }
 
@@ -1370,7 +1373,9 @@ Item {
         var dstLayer = getLayerByName(_execDstName)
         if (!srcLayer || !dstLayer) { _isExecuting = false; return }
 
-        var batchSize = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        // Fixed at 500 — fewer commits than small batches (less SQLite checkpoint
+        // overhead) while still updating progress every few seconds.
+        var batchSize = 500
         var features  = []
         try {
             var it = LayerUtils.createFeatureIteratorFromExpression(srcLayer, expr)
@@ -1442,8 +1447,9 @@ Item {
     function processCopyNextChunk() {
         if (_cancelRequested || !_copyIter) {
             moveFeatureModel.batchMode = false
-            _copyIter    = null
-            _isExecuting = false
+            _copyIter      = null
+            _isExecuting   = false
+            _isFinalising  = false
             mainWindow.displayToast(_cancelRequested
                 ? qsTr("Cancelled — %1 feature(s) copied.").arg(_progressCount)
                 : qsTr("Copied %1 feature(s): '%2' -> '%3'")
@@ -1465,7 +1471,9 @@ Item {
         var srcFieldNames = []
         try { srcFieldNames = srcLayer.fields.names || [] } catch(e) {}
 
-        var CHUNK   = filterMemory.subsetCap > 0 ? filterMemory.subsetCap : 500
+        // Fixed at 100 — iterator stays open between chunks (no re-scan, no per-chunk
+        // commit) so each chunk is fast while progress updates are frequent.
+        var CHUNK   = 100
         var written = 0
         var hasMore = false
 
@@ -1498,15 +1506,26 @@ Item {
         _progressCount += written
 
         if (!hasMore) {
-            moveFeatureModel.batchMode = false
-            _copyIter    = null
-            _isExecuting = false
-            mainWindow.displayToast(
-                qsTr("Copied %1 feature(s): '%2' -> '%3'")
-                    .arg(_progressCount).arg(_execSrcName).arg(_execDstName))
-            mainDialog.close(); return
+            // Iterator exhausted — show "Finishing up" then yield so the UI
+            // updates before batchMode=false triggers the final blocking commit.
+            _isFinalising = true
+            _copyIter = null
+            Qt.callLater(finaliseCopy)
+            return
         }
         Qt.callLater(processCopyNextChunk)
+    }
+
+    // ── Finalise copy after last chunk — runs after a UI yield so "Finishing up"
+    // is visible before the blocking batchMode=false commit.
+    function finaliseCopy() {
+        moveFeatureModel.batchMode = false   // triggers final write — may block briefly
+        _isExecuting  = false
+        _isFinalising = false
+        mainWindow.displayToast(
+            qsTr("Copied %1 feature(s): '%2' -> '%3'")
+                .arg(_progressCount).arg(_execSrcName).arg(_execDstName))
+        mainDialog.close()
     }
 
     // ── Shared: write a batch of features into dstLayer ───────────────────────
