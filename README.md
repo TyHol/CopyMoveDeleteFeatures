@@ -19,15 +19,8 @@ Filters are saved per layer and restored automatically the next session.
 
 ## Installation
 
-Copy the `CopyMoveDeleteFeatures` folder into your QField plugins directory:
+<img width="364" height="366" alt="image" src="https://github.com/user-attachments/assets/12bf8696-6357-43f4-9200-4bd11d83df70" />
 
-| Platform | Directory |
-|---|---|
-| Android | `<device>/QField/plugins/` |
-| Windows | `%APPDATA%\QField\plugins\` |
-| Linux / macOS | `~/.local/share/QField/plugins/` |
-
-Restart QField and enable the plugin from **Settings → Plugins**.
 
 ## Usage
 
